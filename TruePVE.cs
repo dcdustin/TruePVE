@@ -10,14 +10,38 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
 
+/*
+Added the following non-allocating API methods that take in a collection parameter
+bool RemoveMappings(List<string> keys, List<string> results = null)
+void GetMappingsDictionaryNoAlloc(Dictionary<string, string> dict)
+void GetMappingsListNoAlloc(List<string> list)
+
+Fixed issue with evaluation of mounted damage
+Added `Allow Thirst And Hunger Damage To Farmable Animals` (true)
+Added `Enable codelock anti-griefing` (false)
+Added `Enable support for npcs to cause armor damage on hit` (false) - this is relative, not random, and uses vanilla damage and protection
+Added `Enable npc to play headshot sound when a player is headshot` (false) - requires above to be enabled!
+Added `Protect unlocked TC from being looted by enemy players` (false)
+Added `Prevent player shield from dropping on death` (false)
+Added `Prevent player active item from dropping on death` (false)
+Added `Prevent player backpack from dropping on death (Rust backpack)` (false)
+Added `Prevent players from using enemy car lifts` (false)
+Added `Enable support to allow adding locks to various containers` (false) - includes shutter
+Added `Exceptions for locks to various containers option`
+Added `Auto lock (codelock, keylock, nothing)` - this is exclusively for storage containers only atm (TC is included, it is a storage container)
+Fixed damage to NPCPlayer when no initiator is set
+Changed `Block Decay Damage To Vehicles` to allow horse to decay to 90% health in order to produce dung.
+*/
+
 namespace Oxide.Plugins
 {
-    [Info("TruePVE", "nivex", "2.2.9")]
+    [Info("TruePVE", "nivex", "2.2.922")]
     [Description("Improvement of the default Rust PVE behavior")]
     // Thanks to the original author, ignignokt84.
     internal class TruePVE : RustPlugin
@@ -85,6 +109,7 @@ namespace Oxide.Plugins
             HopperCannotTargetEnemyLoot = 1uL << 46
         }
 
+        private bool IsUnloading;
         private Timer scheduleUpdateTimer;                              // timer to check for schedule updates
         private bool shareRedirectDudEnabled;                           // undocumented. UAYOR.
         private RuleSet dudRuleSet;                                     // dud ruleset when no locations are shared
@@ -275,6 +300,7 @@ namespace Oxide.Plugins
 		
         private void Unload()
         {
+            IsUnloading = true;
             scheduleUpdateTimer?.Destroy();
             _npcCache.CancelInvoke();
             SaveData();
@@ -318,8 +344,22 @@ namespace Oxide.Plugins
 
         private void Init()
         {
+            if (!config.options.NoShieldDrop)
+            {
+                Unsubscribe(nameof(OnPlayerActiveShieldDrop));
+            }
+            if (!config.options.NoActiveItemDrop)
+            {
+                Unsubscribe(nameof(OnPlayerDropActiveItem));
+            }
+            if (!config.options.NoRustBackpackDrop)
+            {
+                Unsubscribe(nameof(OnBackpackDrop));
+            }
+            Unsubscribe(nameof(CanLootEntity));
+            Unsubscribe(nameof(OnCodeEntered));
+            Unsubscribe(nameof(OnCupboardAuthorize));
             Unsubscribe(nameof(CanHelicopterStrafeTarget));
-            Unsubscribe(nameof(OnTimedExplosiveExplode));
 			Unsubscribe(nameof(CanWaterBallSplash));
             Unsubscribe(nameof(OnEntityMarkHostile));
             Unsubscribe(nameof(OnEntitySpawned));
@@ -418,10 +458,18 @@ namespace Oxide.Plugins
             {
                 Subscribe(nameof(OnWallpaperRemove));
             }
-            Subscribe(nameof(OnTimedExplosiveExplode));
+            if (config.options.ProtectTC)
+            {
+                Subscribe(nameof(OnCupboardAuthorize));
+            }
+            if (config.options.Lifts)
+            {
+                Subscribe(nameof(CanLootEntity));
+            }
             Subscribe(nameof(OnEntitySpawned));
             Subscribe(nameof(OnMlrsFire));
             BuildPrefabIds();
+            AllowLocksOnContainers();
         }
 
         private IEnumerator OvenCo()
@@ -1561,6 +1609,9 @@ namespace Oxide.Plugins
             return attacker.GetBuildingPrivilege(heli.WorldSpaceBounds(), true) is BuildingPrivlidge priv && priv.AnyAuthed() && priv.IsAuthed(attacker);
         }
 
+        private readonly Dictionary<SkeletonProperties.BoneProperty[], Dictionary<HitArea, uint>> _boneCache = new();
+        private const HitArea noHitArea = (HitArea)(-1);
+
         // determines if an entity is "allowed" to take damage
         private bool AllowDamage(BaseEntity entity, HitInfo info)
         {
@@ -1661,7 +1712,7 @@ namespace Oxide.Plugins
             {
                 if (entity is BaseVehicle)
                 {
-                    return !config.BlockDecayDamageToVehicles;
+                    return entity is RidableHorse2 horse && horse.healthFraction > 0.9f ? true : !config.BlockDecayDamageToVehicles;
                 }
                 return true;
             }
@@ -1761,13 +1812,20 @@ namespace Oxide.Plugins
                     }
 
                     mountRulesEvaluated = true;
-                    
-                    var mounted = attacker.GetMounted() as BaseMountable; 
-                    if (mounted != null && EvaluateRules(entity, mounted, ruleSet, false) == DamageResult.Block)
+                    var mounted = attacker.GetMounted();
+                    if (mounted != null)
                     {
-                        if (trace) Trace($"Player is mounted; evaluation? block and return", 1);
-                        return false;
+                        var parent = GetParentEntity(mounted);
+                        if (parent != null && EvaluateRules(entity, parent, ruleSet, false) == DamageResult.Block)
+                        {
+                            if (trace) Trace($"Player is mounted; evaluation? block and return", 1);
+                            return false;
+                        }
                     }
+                }
+                else if (config.options.ArmorDamage && isAttacker && isVicId && info.boneArea == noHitArea && victim.skeletonProperties?.bones != null)
+                {
+                    HandleHitArea(victim, info);
                 }
 
                 if (config.options.UnderworldOther > -500f && (!isAttacker || !attacker.userID.IsSteamId()) && info.HitPositionWorld.y <= config.options.UnderworldOther && info.PointStart.y <= config.options.UnderworldOther)
@@ -1933,11 +1991,16 @@ namespace Oxide.Plugins
                     if (trace) Trace("Initiator is hurt trigger; allow and return", 1);
                     return true;
                 }
+                if (entity is FarmableAnimal && damageType == DamageType.Generic)
+                {
+                    if (trace) Trace($"Initiator is thirst or hunger; {(config.options.FarmableMetabolism ? "allow and return" : "block and return")}", 1);
+                    return config.options.FarmableMetabolism;
+                }
                 foreach (DamageType _damageType in _damageTypes)
                 {
                     if (info.damageTypes.Has(_damageType))
                     {
-                        if (entity is NPCPlayerCorpse || entity is BaseCorpse && !(entity is PlayerCorpse))
+                        if ((entity is NPCPlayerCorpse or NPCPlayer) || (entity is BaseCorpse and not PlayerCorpse))
                         {
                             if (trace) _tsb.Clear(); // reduce useless spam
                             return true;
@@ -1945,7 +2008,7 @@ namespace Oxide.Plugins
                         bool tut = IsTutorialNetworkGroup(entity);
                         if (trace)
                         {
-                            string action = tut ? "allow and return (Tutorial Zone)" : ruleSet.defaultAllowDamage ? "defaultAllowDamage is true; allow and return" : "block and return";
+                            string action = tut ? "allow and return (Tutorial Zone)" : ruleSet.defaultAllowDamage ? "allow and return" : "block and return";
                             Trace($"Initiator empty for player damage; {action} (Damage Type: {damageType}, Damage Amount: {damageAmount})", 1);
                         }
                         return tut || ruleSet.defaultAllowDamage;
@@ -1980,7 +2043,7 @@ namespace Oxide.Plugins
                 return isAllowed;
             }
 
-            if ((isAttacker && !isAtkId) || initiator is BaseNpc || initiator is BaseNPC2)
+            if ((isAttacker && !isAtkId) || (initiator is BaseNpc or BaseNPC2 or BeeSwarmAI))
             {
                 if (isVictim && (_flags & RuleFlags.ProtectedSleepers) != 0 && victim.IsSleeping())
                 {
@@ -2043,11 +2106,15 @@ namespace Oxide.Plugins
             {
                 if (isAtkId && !mountRulesEvaluated)
                 {
-                    var mounted = attacker.GetMounted() as BaseMountable;
-                    if (mounted != null && EvaluateRules(entity, mounted, ruleSet, false) == DamageResult.Block)
+                    var mounted = attacker.GetMounted();
+                    if (mounted != null)
                     {
-                        if (trace) Trace($"Player is mounted; evaluation? block and return", 1);
-                        return false;
+                        var parent = GetParentEntity(mounted);
+                        if (parent != null && EvaluateRules(entity, parent, ruleSet, false) == DamageResult.Block)
+                        {
+                            if (trace) Trace($"Player is mounted; evaluation? block and return", 1);
+                            return false;
+                        }
                     }
                 }
 
@@ -2214,6 +2281,83 @@ namespace Oxide.Plugins
             if (trace) Trace("No match in pre-checks; evaluating RuleSet rules...", 1);
             return EvaluateRules(entity, weapon, ruleSet) != DamageResult.Block;
         }
+
+        private void HandleHitArea(BasePlayer victim, HitInfo info)
+        {
+            if (victim.inventory == null || victim.inventory.containerWear == null)
+            {
+                return;
+            }
+            float relative = (info.HitPositionWorld.y - victim.transform.position.y) / (victim.IsDucked() ? 1.1f : 1.8f);
+            HitArea area = victim.IsDucked() switch
+            {
+                true => relative switch
+                {
+                    <= 0.07f => HitArea.Foot,
+                    >= 0.85f => HitArea.Head,
+                    >= 0.65f => HitArea.Chest,
+                    >= 0.45f => HitArea.Stomach,
+                    _ => HitArea.Leg,
+                },
+                false => relative switch
+                {
+                    <= 0.07f => HitArea.Foot,
+                    >= 0.8f => HitArea.Head,
+                    >= 0.7f => HitArea.Chest,
+                    >= 0.5f => HitArea.Stomach,
+                    _ => HitArea.Leg,
+                }
+            };
+            if (config.options.Headshot)
+            {
+                if (!_boneCache.TryGetValue(victim.skeletonProperties.bones, out var boneMapping))
+                {
+                    _boneCache[victim.skeletonProperties.bones] = boneMapping = new();
+                    foreach (var property in victim.skeletonProperties.bones)
+                    {
+                        if (property?.bone?.name != null)
+                        {
+                            boneMapping[property.area] = StringPool.Get(property.bone.name);
+                        }
+                    }
+                }
+                if (boneMapping.TryGetValue(area, out var hitBone))
+                {
+                    info.HitBone = hitBone;
+                }
+            }
+            else if (area != noHitArea)
+            {
+                using var obj = Facepunch.Pool.Get<PooledList<Item>>();
+                obj.AddRange(victim.inventory.containerWear.itemList);
+                for (int i = 0; i < obj.Count; i++)
+                {
+                    Item item = obj[i];
+                    if (item != null)
+                    {
+                        ItemModWearable component = item.info.ItemModWearable;
+                        if (!(component == null) && component.ProtectsArea(area))
+                        {
+                            item.OnAttacked(info);
+                        }
+                    }
+                }
+                victim.inventory.ServerUpdate(0f);
+            }
+        }
+
+        private static BaseEntity GetParentEntity(BaseEntity m)
+        {
+            int n = 0;
+            while (m != null && m.HasParent() && ++n < 30)
+            {
+                if (!(m.GetParentEntity() is BaseEntity parent)) break;
+                m = parent;
+            }
+
+            return m;
+        }
+
 
         private readonly BuildingGrade.Enum[] GradeEnums = new BuildingGrade.Enum[] { BuildingGrade.Enum.Twigs, BuildingGrade.Enum.Wood, BuildingGrade.Enum.Stone, BuildingGrade.Enum.Metal, BuildingGrade.Enum.TopTier };
 
@@ -2841,11 +2985,341 @@ namespace Oxide.Plugins
         }
 #endif
 
+        #region Locks etc
+
+        private object OnPlayerActiveShieldDrop(BasePlayer player, Shield shield) => true; // Shield
+
+        private object OnPlayerDropActiveItem(BasePlayer player, Item item) => true; // Active held item
+
+        private object OnBackpackDrop(Item backpack, PlayerInventory inv) => true; // Rust backpack
+
+
+        private int wrongCodes;
+        private object OnCodeEntered(CodeLock codeLock, BasePlayer player, string code)
+        {
+            if (codeLock == null || player == null || player.limitNetworking) 
+                return null;
+            var parent = codeLock.GetParentEntity() as BaseEntity;
+            if (parent.OwnerID.IsSteamId() && !IsAlly(player.userID, parent.OwnerID))
+            {
+                Effect.server.Run(codeLock.effectDenied.resourcePath, codeLock, 0u, Vector3.zero, Vector3.forward);
+                Effect.server.Run(codeLock.effectShock.resourcePath, codeLock, 0u, Vector3.zero, Vector3.forward);
+                player.Hurt((float)(wrongCodes + 1) * 5f, DamageType.ElectricShock, codeLock, useProtection: false);
+                if (++wrongCodes % 5 == 0)
+                {
+                    player.ShowToast(GameTip.Styles.Red_Normal, CodeLock.blockwarning);
+                }
+                return true;
+            }
+            wrongCodes = 0;
+            return null;
+        }
+
+        private void AllowLocksOnContainers()
+        {
+            if (config.options.Locks)
+            {
+                ServerMgr.Instance.StartCoroutine(LockCo());
+            }
+            if (config.options.Antigrief)
+            {
+                Subscribe(nameof(OnCodeEntered));
+            }
+        }
+
+        private IEnumerator LockCo()
+        {
+            int checks = 0;
+            YieldInstruction instruction = CoroutineEx.waitForSeconds(0.05f);
+            foreach (var ent in BaseNetworkable.serverEntities)
+            {
+                if (++checks >= 200)
+                {
+                    checks = 0;
+                    yield return instruction;
+                }
+                if (IsUnloading)
+                {
+                    yield break;
+                }
+                if (ent is StorageContainer c && c != null && !c.isLockable)
+                {
+                    OnEntitySpawned(c);
+                }
+            }
+        }
+
+        private void CreateKeyLock(BaseEntity entity, ulong userid)
+        {
+            if (GameManager.server.CreateEntity(StringPool.Get(2106860026)) is KeyLock keyLock)
+            {
+                keyLock.gameObject.Identity();
+                keyLock.SetParent(entity, entity.GetSlotAnchorName(BaseEntity.Slot.Lock));
+                keyLock.Spawn();
+                entity.SetSlot(BaseEntity.Slot.Lock, keyLock);
+                keyLock.OwnerID = userid;
+                keyLock.firstKeyCreated = true;
+                keyLock.SetFlag(BaseEntity.Flags.Locked, true);
+            }
+        }
+
+        private void CreateCodeLock(BaseEntity entity, ulong userid)
+        {
+            if (GameManager.server.CreateEntity(StringPool.Get(3518824735)) is CodeLock codeLock)
+            {
+                codeLock.gameObject.Identity();
+                codeLock.SetParent(entity, entity.GetSlotAnchorName(BaseEntity.Slot.Lock));
+                codeLock.Spawn();
+                entity.SetSlot(BaseEntity.Slot.Lock, codeLock);
+                codeLock.code = UnityEngine.Random.Range(1000, 9999).ToString();
+                codeLock.hasCode = true;
+                codeLock.OwnerID = userid;
+                codeLock.guestCode = string.Empty;
+                codeLock.hasGuestCode = false;
+                codeLock.guestPlayers.Clear();
+                codeLock.whitelistPlayers.Clear();
+                codeLock.whitelistPlayers.Add(userid);
+                codeLock.SetFlag(BaseEntity.Flags.Locked, true);
+            }
+        }
+
+        private readonly List<string> doors = new() { "shutter.wood.a" };
+
+        private void OnEntitySpawned(Door door)
+        {
+            if (config.options.Locks && door != null && !door.canTakeLock && door.OwnerID.IsSteamId() && doors.Contains(door.ShortPrefabName))
+            {
+                door.canTakeLock = true;
+            }
+        }
+
+        private void OnEntitySpawned(StorageContainer container)
+        {
+            if (config.options.Locks && container != null && !container.isLockable && container.OwnerID.IsSteamId())
+            {
+                container.isLockable = !config.options.NoLocks.Contains(container.ShortPrefabName) && !config.options.NoLocks.Contains(GetTypeName(container));
+            }
+
+            if (config.options.AutoLock.TryGetValue(container.ShortPrefabName, out string type) || config.options.AutoLock.TryGetValue(GetTypeName(container), out type))
+            {
+                if (type.Equals("nothing", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                container.Invoke(() =>
+                {
+                    if (container.IsDestroyed)
+                        return;
+
+                    var slot = container.GetSlot(BaseEntity.Slot.Lock);
+
+                    if (slot != null)
+                        return;
+
+                    if (type == "codelock")
+                    {
+                        CreateCodeLock(container, container.OwnerID);
+                    }
+                    else if (type == "keylock")
+                    {
+                        CreateKeyLock(container, container.OwnerID);
+                    }
+                }, 0.3f);
+            }
+        }
+
+        private void OnEntitySpawned(BaseLock baseLock)
+        {
+            if (!config.options.Locks || baseLock == null)
+            {
+                return;
+            }
+
+            BaseEntity entity = baseLock.GetParentEntity();
+            if (entity == null || !entity.OwnerID.IsSteamId())
+            {
+                return;
+            }
+
+            if (config.options.NoLocks.Count > 0)
+            {
+                if (config.options.NoLocks.Contains(entity.ShortPrefabName))
+                {
+                    return;
+                }
+                if (config.options.NoLocks.Contains(GetTypeName(entity)))
+                {
+                    return;
+                }
+            }
+            
+            if (entity is StashContainer)
+            {
+                baseLock.transform.localPosition = new Vector3(0, -0.3f, 0f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 0f, 90f);
+            }
+            else if (entity is Beehive)
+            {
+                baseLock.transform.localPosition = new Vector3(0, 0.8f, 0.3f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+            }
+            else if (entity is FishMount or HuntingTrophy or PhotoFrame)
+            {
+                baseLock.transform.localPosition = new Vector3(0, entity.bounds.extents.y + 0.25f, 0f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+            }
+            else if (entity is WeaponRack)
+            {
+                baseLock.transform.localPosition = new Vector3(-entity.bounds.extents.x + 0.15f, entity.bounds.extents.y * 1.25f, 0f);
+                if (entity.ShortPrefabName == "weaponrack_stand.deployed") baseLock.transform.localPosition += new Vector3(0f, 0.65f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+            }
+            else if (entity.ShortPrefabName == "bbq.deployed")
+            {
+                baseLock.transform.localPosition = new Vector3(0.3f, 0.75f, 0f);
+            }
+            else if (entity is CookingWorkbenchBbq)
+            {
+                baseLock.transform.localPosition = new Vector3(0.3f, -3f, -0.3f);
+            }
+            else if (entity is ChickenCoop)
+            {
+                baseLock.transform.localPosition = new Vector3(-0.3f, 0.35f, 1.5f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+            }
+            else if (entity is Composter || entity.ShortPrefabName == "refinery_small_deployed")
+            {
+                baseLock.transform.localPosition += new Vector3(0.6f, 0.75f, 0f);
+            }
+            else if (entity.ShortPrefabName == "fireplace.deployed")
+            {
+                baseLock.transform.localPosition += new Vector3(-1.0f, 0.9f, -0.225f);
+            }
+            else if (entity is FlameTurret)
+            {
+                baseLock.transform.localPosition += new Vector3(-0.075f, 0.165f, 0.075f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 45f, 0f);
+            }
+            else if (entity.ShortPrefabName == "furnace")
+            {
+                baseLock.transform.localPosition += new Vector3(0f, 1.2f, 0.2f);
+                baseLock.transform.localRotation = new Quaternion(0f, -0.7f, 0f, 0.7f);
+            }
+            else if (entity.ShortPrefabName == "legacy_furnace")
+            {
+                baseLock.transform.localPosition += new Vector3(0f, 1.2f, 0.275f);
+                baseLock.transform.localRotation = new Quaternion(0f, -0.7f, 0f, 0.7f);
+            }
+            else if (entity.ShortPrefabName == "furnace.large")
+            {
+                baseLock.transform.localPosition += new Vector3(0.75f, 1f, -0.75f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 45f, 0f);
+            }
+            else if (entity.ShortPrefabName == "electricfurnace.deployed")
+            {
+                baseLock.transform.localPosition += new Vector3(0f, 0.215f, 0.275f);
+                baseLock.transform.localRotation = new Quaternion(0f, -0.7f, 0f, 0.7f);
+            }
+            else if (entity is Stocking)
+            {
+                baseLock.transform.localPosition += new Vector3(-0.1f, 0.25f, 0f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+            }
+            else if (entity is GunTrap or TorchDeployableLightSource or BaseFuelLightSource)
+            {
+                baseLock.transform.localPosition += new Vector3(0f, 0.4f, 0f);
+            }
+            else if (entity.ShortPrefabName == "hitchtrough.deployed")
+            {
+                baseLock.transform.localPosition = new Vector3(-1.115f, 0.503f, 0.1f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 180f, 10f);
+            }
+            else if (entity is MixingTable)
+            {
+                baseLock.transform.localPosition = new Vector3(-0.575f, 0.4f, 0.275f);
+            }
+            else if (entity is Mailbox)
+            {
+                baseLock.transform.localPosition = new Vector3(-0.1f, 1.1675f, 0.2f);
+            }
+            else if (entity.ShortPrefabName == "planter.large.deployed" || entity.ShortPrefabName == "planter.triangle.deployed")
+            {
+                baseLock.transform.localPosition = new Vector3(0f, 0.45f, 0f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 0f, 90f);
+            }
+            else if (entity.ShortPrefabName == "planter.small.deployed")
+            {
+                baseLock.transform.localPosition = new Vector3(0f, 0.45f, 0f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 0f, 90f);
+            }
+            else if (entity.ShortPrefabName == "bathtub.planter.deployed")
+            {
+                baseLock.transform.localPosition = new Vector3(0f, 0.45f, 0.65f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+            }
+            else if (entity.ShortPrefabName == "minecart.planter.deployed")
+            {
+                baseLock.transform.localPosition = new Vector3(0f, 0.65f, 0.55f);
+                baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+            }
+            else if (entity is ResearchTable)
+            {
+                baseLock.transform.localPosition += new Vector3(0f, 0.3f, 0f);
+                baseLock.transform.localRotation = new Quaternion(0f, -0.7f, 0f, 0.7f);
+            }
+            else if (entity is Workbench)
+            {
+                if (entity.ShortPrefabName == "io.table.deployed")
+                {
+                    baseLock.transform.localPosition += new Vector3(0f, 1.1f, 0f);
+                    baseLock.transform.localRotation = Quaternion.Euler(0f, 90f, -45f);
+                }
+                else
+                {
+                    baseLock.transform.localPosition += new Vector3(0f, 0.9f, 0f);
+                    baseLock.transform.localRotation = new Quaternion(0f, 0f, 1f, 1f);
+                }
+            }
+            else if (entity is VendingMachine)
+            {
+                baseLock.transform.localPosition += new Vector3(-0.5175f, 0.15f, -0.5f);
+            }
+        }
+
+        private object OnCupboardAuthorize(BuildingPrivlidge priv, BasePlayer player)
+        {
+            if (priv == null || !priv.OwnerID.IsSteamId()) return null;
+            BaseLock baseLock = priv.GetSlot(BaseEntity.Slot.Lock) as BaseLock;
+            if (baseLock != null && baseLock.IsLocked()) return null;
+            if (IsAlly(priv.OwnerID, player.userID)) return null;
+            Message(player, "Error_CannotAccessEntity");
+            return false;
+        }
+
+        private object CanLootEntity(BasePlayer player, ModularCarGarage carLift)
+        {
+            if (player == null || carLift == null || carLift.OwnerID == player.userID)
+                return null;
+
+            if (carLift.carOccupant != null && carLift.carOccupant.HasSlot(BaseEntity.Slot.Lock))
+                return null;
+
+            if (carLift.OwnerID.IsSteamId() && !IsAlly(carLift.OwnerID, player.userID))
+                return true;
+
+            return null;
+        }
+
+        #endregion Locks
+
         private void OnEntitySpawned(BaseOven oven)
         {
             if (config.options.disableBaseOvenSplash && oven != null)
             {
                 oven.disabledBySplash = false;
+            }
+            if (config.options.Locks && oven != null && oven is StorageContainer c)
+            {
+                OnEntitySpawned(c);
             }
         }
 
@@ -2858,33 +3332,6 @@ namespace Oxide.Plugins
             if (systems[0].rocketOwnerRef.Get(true) is not BasePlayer owner) return;
             rocket.creatorEntity = owner;
             rocket.OwnerID = owner.userID;
-        }
-
-        private BeeSwarmMaster _lastSwarmMaster;
-        private void OnEntitySpawned(BeeSwarmMaster swarm)
-        {
-            if (swarm == null || swarm.creatorEntity != null) return;
-            _lastSwarmMaster = swarm;
-            InvokeHandler.Instance.Invoke(() => _lastSwarmMaster = null, 0.1f);
-        }
-
-        private void OnTimedExplosiveExplode(BeeGrenade grenade, Vector3 fxPos)
-        {
-            if (_lastSwarmMaster == null || _lastSwarmMaster.IsDestroyed || grenade == null || grenade.IsDestroyed) return;
-            if (InRange(_lastSwarmMaster.transform.position, grenade.transform.position, 3f))
-            {
-                _lastSwarmMaster.creatorEntity = grenade.creatorEntity;
-            }
-            _lastSwarmMaster = null;
-        }
-
-        private void OnEntitySpawned(BeeSwarmAI ai)
-        {
-            if (ai == null || ai.IsDestroyed || ai.creatorEntity != null) return;
-            using var masters = Pool.Get<PooledList<BeeSwarmMaster>>();
-            Vis.Entities(ai.transform.position, 0.001f, masters);
-            if (masters.Count == 0 || masters[0] == null) return;
-            ai.creatorEntity = masters[0].creatorEntity;
         }
 
         private bool CheckIsEventTerritory(Vector3 position)
@@ -2967,7 +3414,7 @@ namespace Oxide.Plugins
                 return null;
             }
 
-            if ((ruleSet._flags & RuleFlags.HopperCannotTargetEnemyLoot) != 0)
+            if ((ruleSet._flags & RuleFlags.HopperCannotTargetEnemyLoot) != 0 && entity is Hopper)
             {
                 DroppedItem di = target as DroppedItem;
                 if (di != null)
@@ -2977,7 +3424,7 @@ namespace Oxide.Plugins
                         if (trace) Trace($"Dropped item does not belong to a player; allow and return", 2);
                         return null;
                     }
-                    if (di.DroppedBy == entity.OwnerID || IsAuthed(di, entity))
+                    if (di.DroppedBy == 0 || di.DroppedBy == entity.OwnerID || IsAuthed(di, entity))
                     {
                         if (trace) Trace($"{entity} is authorized to loot the dropped item; allow and return", 2);
                         return null;
@@ -3487,16 +3934,51 @@ namespace Oxide.Plugins
         }
 
         // remove a mapping
+        private Timer _removeMappingTimer;
         private bool RemoveMapping(string key)
         {
-            if (config.mappings.Remove(key))
+            if (!string.IsNullOrEmpty(key) && config.mappings.Remove(key))
             {
-                SaveConfig();
+                if (_removeMappingTimer != null) _removeMappingTimer.Reset();
+                else _removeMappingTimer = timer.Once(1f, SaveConfig);
                 SetUseZones();
                 return true;
             }
             return false;
         }
+
+        // remove a list of mappings, optionally add removed mappings to results
+        private bool RemoveMappings(List<string> keys, List<string> results = null)
+        {
+            bool ret = false;
+            if (!keys.IsNullOrEmpty())
+            {
+                foreach (var key in keys)
+                {
+                    if (RemoveMapping(key))
+                    {
+                        ret = true;
+                        results?.Add(key);
+                    }
+                }
+            }
+            return ret;
+        }
+
+        // get all mappings
+        private void GetMappingsDictionaryNoAlloc(Dictionary<string, string> dict)
+        {
+            foreach (var pair in config.mappings)
+            {
+                dict[pair.Key] = pair.Value;
+            }
+        }
+
+        private void GetMappingsListNoAlloc(List<string> list)
+        {
+            list.AddRange(config.mappings.Keys);
+        }
+
         #endregion
 
         #region Messaging
@@ -3784,6 +4266,42 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Allow Heat Metabolism Damage")]
             public bool Heat;
+
+            [JsonProperty(PropertyName = "Allow Thirst And Hunger Damage To Farmable Animals")]
+            public bool FarmableMetabolism = true;
+
+            [JsonProperty(PropertyName = "Enable codelock anti-raiding")]
+            public bool Antigrief;
+
+            [JsonProperty(PropertyName = "Enable support for npcs to cause armor damage on hit")]
+            public bool ArmorDamage;
+
+            [JsonProperty(PropertyName = "Enable npc to play headshot sound when a player is headshot")]
+            public bool Headshot;
+
+            [JsonProperty(PropertyName = "Protect unlocked TC from being accessed by enemy players")]
+            public bool ProtectTC;
+
+            [JsonProperty(PropertyName = "Prevent player shield from dropping on death")]
+            public bool NoShieldDrop;
+
+            [JsonProperty(PropertyName = "Prevent player active item from dropping on death")]
+            public bool NoActiveItemDrop;
+
+            [JsonProperty(PropertyName = "Prevent player backpack from dropping on death (Rust backpack)")]
+            public bool NoRustBackpackDrop;
+
+            [JsonProperty(PropertyName = "Prevent players from using enemy car lifts")]
+            public bool Lifts;
+
+            [JsonProperty(PropertyName = "Enable support to allow adding locks to various containers")]
+            public bool Locks;
+
+            [JsonProperty(PropertyName = "Exceptions for locks to various containers option", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> NoLocks = new() { "skulltrophy.deployed", "skull_fire_pit", "bbq.static", "small_refinery_static", "campfire" };
+
+            [JsonProperty(PropertyName = "Auto lock (codelock, keylock, nothing)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, string> AutoLock = new() { ["cupboard.tool.deployed"] = "nothing" };
         }
 
         private class ReflectDamagePVP
@@ -4692,6 +5210,7 @@ namespace Oxide.Plugins
                 {"Format_ErrorSize", "12"},
 
                 {"Error_TimeLeft", "You must wait another {0} hours to attack this player."},
+                {"Error_CannotAccessEntity", "You are not allowed to access this" },
             }, this);
         }
 
