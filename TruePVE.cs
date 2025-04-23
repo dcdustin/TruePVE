@@ -23,10 +23,14 @@ void GetMappingsDictionaryNoAlloc(Dictionary<string, string> dict)
 void GetMappingsListNoAlloc(List<string> list)
 
 Fixed issue with evaluation of mounted damage
+Fixed schedule to revert to the prior entry when there isn’t a valid current entry
+Fixed damage to NPCPlayer when no initiator is set
+Blocked animals from targeting any players during server restarts
+Blocked RC turret damage when TurretsIgnorePlayers flag is added
 Added `Allow Thirst And Hunger Damage To Farmable Animals` (true)
 Added `Enable codelock anti-griefing` (false)
-Added `Enable support for npcs to cause armor damage on hit` (false) - this is relative, not random, and uses vanilla damage and protection
-Added `Enable npc to play headshot sound when a player is headshot` (false) - requires above to be enabled!
+Added `Enable support for npcs to cause armor damage on hit` (false) - uses vanilla damage and protection
+Added `Play headshot sound when a player is headshot by an npc` (false) - requires armor damage to be enabled
 Added `Protect unlocked TC from being looted by enemy players` (false)
 Added `Prevent player shield from dropping on death` (false)
 Added `Prevent player active item from dropping on death` (false)
@@ -35,13 +39,12 @@ Added `Prevent players from using enemy car lifts` (false)
 Added `Enable support to allow adding locks to various containers` (false) - includes shutter
 Added `Exceptions for locks to various containers option`
 Added `Auto lock (codelock, keylock, nothing)` - this is exclusively for storage containers only atm (TC is included, it is a storage container)
-Fixed damage to NPCPlayer when no initiator is set
 Changed `Block Decay Damage To Vehicles` to allow horse to decay to 90% health in order to produce dung.
 */
 
 namespace Oxide.Plugins
 {
-    [Info("TruePVE", "nivex", "2.2.922")]
+    [Info("TruePVE", "nivex", "2.2.927")]
     [Description("Improvement of the default Rust PVE behavior")]
     // Thanks to the original author, ignignokt84.
     internal class TruePVE : RustPlugin
@@ -370,7 +373,6 @@ namespace Oxide.Plugins
             Unsubscribe(nameof(OnPlayerConnected));
             Unsubscribe(nameof(OnSamSiteTarget));
             Unsubscribe(nameof(OnTrapTrigger));
-            Unsubscribe(nameof(OnNpcTarget));
             Unsubscribe(nameof(OnMlrsFire));
             // register console commands automagically
             foreach (Command command in Enum.GetValues(typeof(Command)))
@@ -394,6 +396,7 @@ namespace Oxide.Plugins
 
         private void OnServerInitialized(bool isStartup)
         {
+            isServerStartingUp = false;
             // check for server pve setting
             if (ConVar.Server.pve) WarnPve();
             // load configuration
@@ -407,9 +410,9 @@ namespace Oxide.Plugins
             {
                 TimerLoop(true);
             }
-            if (config.ruleSets.Exists(ruleSet => (ruleSet._flags & RuleFlags.AnimalsIgnoreSleepers) != 0))
+            if (!animalsIgnoreSleepers && !config.ruleSets.Exists(ruleSet => ruleSet.HasFlag(RuleFlags.AnimalsIgnoreSleepers)))
             {
-                Subscribe(nameof(OnNpcTarget));
+                Unsubscribe(nameof(OnNpcTarget));
             }
             if (config.PreventSafeZoneStrafing)
             {
@@ -1609,7 +1612,6 @@ namespace Oxide.Plugins
             return attacker.GetBuildingPrivilege(heli.WorldSpaceBounds(), true) is BuildingPrivlidge priv && priv.AnyAuthed() && priv.IsAuthed(attacker);
         }
 
-        private readonly Dictionary<SkeletonProperties.BoneProperty[], Dictionary<HitArea, uint>> _boneCache = new();
         private const HitArea noHitArea = (HitArea)(-1);
 
         // determines if an entity is "allowed" to take damage
@@ -1621,8 +1623,27 @@ namespace Oxide.Plugins
                 _tsb.Length = 0;
             }
 
+            var initiator = info.Initiator switch
+            {
+                BasePlayer player => player,
+                { creatorEntity: BasePlayer player } => player,
+                { parentEntity: EntityRef parentRef } when parentRef.Get(true) is BasePlayer player => player,
+                _ => info.Initiator ?? info.WeaponPrefab
+            };
+
+            var victim = entity as BasePlayer;
+            var attacker = initiator as BasePlayer;
+            var isAttacker = attacker != null && !attacker.IsDestroyed;
+            var isAtkId = isAttacker && attacker.userID.IsSteamId();
+            var isVictim = victim != null && !victim.IsDestroyed;
+            var isVicId = isVictim && victim.userID.IsSteamId();
+
             if (Interface.CallHook("CanEntityTakeDamage", new object[] { entity, info }) is bool val)
             {
+                if (val && config.options.ArmorDamage.Enabled && isAttacker && !isAtkId && isVicId && info.boneArea == noHitArea)
+                {
+                    HandleHitArea(victim, info);
+                }
                 return val;
             }
 
@@ -1633,24 +1654,10 @@ namespace Oxide.Plugins
                 return true;
             }
 
-            var initiator = info.Initiator switch
+            if (config.options.ArmorDamage.Enabled && isAttacker && !isAtkId && isVicId && info.boneArea == noHitArea)
             {
-                BasePlayer player => player,
-                { creatorEntity: BasePlayer player } => player,
-                { parentEntity: EntityRef parentRef } when parentRef.Get(true) is BasePlayer player => player,
-                _ => info.WeaponPrefab switch
-                {
-                    BasePlayer player => player,
-                    { creatorEntity: BasePlayer player } => player,
-                    { parentEntity: EntityRef parentRef } when parentRef.Get(true) is BasePlayer player => player,
-                    _ => info.Weapon switch
-                    {
-                        { creatorEntity: BasePlayer player } => player,
-                        { parentEntity: EntityRef parentRef } when parentRef.Get(true) is BasePlayer player => player,
-                        _ => info.Initiator
-                    }
-                }
-            };
+                HandleHitArea(victim, info);
+            }
 
             if (_allowKillingSleepersEnabled && AllowKillingSleepers(entity, initiator))
             {
@@ -1670,8 +1677,6 @@ namespace Oxide.Plugins
                 info.damageTypes.Clear();
                 return true;
             }
-
-            var victim = entity as BasePlayer;
 
             if (config.scrap)
             {
@@ -1755,11 +1760,6 @@ namespace Oxide.Plugins
 
             if (trace) Trace($"Using RuleSet \"{ruleSet.name}\"", 1);
 
-            var attacker = initiator as BasePlayer;
-            var isAttacker = attacker != null && !attacker.IsDestroyed;
-            var isAtkId = isAttacker && attacker.userID.IsSteamId();
-            var isVictim = victim != null && !victim.IsDestroyed;
-            var isVicId = isVictim && victim.userID.IsSteamId();
             var selfDamageFlag = (_flags & RuleFlags.SelfDamage) != 0;
             var mountRulesEvaluated = false;
 
@@ -1822,10 +1822,6 @@ namespace Oxide.Plugins
                             return false;
                         }
                     }
-                }
-                else if (config.options.ArmorDamage && isAttacker && isVicId && info.boneArea == noHitArea && victim.skeletonProperties?.bones != null)
-                {
-                    HandleHitArea(victim, info);
                 }
 
                 if (config.options.UnderworldOther > -500f && (!isAttacker || !attacker.userID.IsSteamId()) && info.HitPositionWorld.y <= config.options.UnderworldOther && info.PointStart.y <= config.options.UnderworldOther)
@@ -2060,25 +2056,33 @@ namespace Oxide.Plugins
 
             if (isVictim)
             {
-                if (isVicId && initiator is AutoTurret && initiator.OwnerID == 0)
+                if (isVicId && initiator is AutoTurret)
                 {
-                    if (initiator is NPCAutoTurret)
+                    if (initiator.OwnerID == 0)
                     {
-                        bool safezoneFlag = (_flags & RuleFlags.SafeZoneTurretsIgnorePlayers) == 0;
+                        if (initiator is NPCAutoTurret)
+                        {
+                            bool safezoneFlag = (_flags & RuleFlags.SafeZoneTurretsIgnorePlayers) == 0;
+                            if (trace)
+                            {
+                                string action = safezoneFlag ? "allow and return" : "block and return";
+                                Trace($"Initiator is npc turret; Target is player; {action}", 1);
+                            }
+                            return safezoneFlag;
+                        }
+                        bool staticFlag = (_flags & RuleFlags.StaticTurretsIgnorePlayers) == 0;
                         if (trace)
                         {
-                            string action = safezoneFlag ? "allow and return" : "block and return";
-                            Trace($"Initiator is npc turret; Target is player; {action}", 1);
+                            string action = staticFlag ? "allow and return" : "block and return";
+                            Trace($"Initiator is static turret; Target is player; {action}", 1);
                         }
-                        return safezoneFlag;
+                        return staticFlag;
                     }
-                    bool staticFlag = (_flags & RuleFlags.StaticTurretsIgnorePlayers) == 0;
-                    if (trace)
+                    if (initiator.OwnerID.IsSteamId() && (_flags & RuleFlags.TurretsIgnorePlayers) != 0)
                     {
-                        string action = staticFlag ? "allow and return" : "block and return";
-                        Trace($"Initiator is static turret; Target is player; {action}", 1);
+                        if (trace) Trace($"Initiator is RC turret; Target is player; block and return", 1);
+                        return false;
                     }
-                    return staticFlag;
                 }
 
                 // handle suicide
@@ -2284,7 +2288,7 @@ namespace Oxide.Plugins
 
         private void HandleHitArea(BasePlayer victim, HitInfo info)
         {
-            if (victim.inventory == null || victim.inventory.containerWear == null)
+            if (victim == null || victim.inventory == null || victim.inventory.containerWear == null || victim.inventory.containerWear.itemList == null)
             {
                 return;
             }
@@ -2308,41 +2312,32 @@ namespace Oxide.Plugins
                     _ => HitArea.Leg,
                 }
             };
-            if (config.options.Headshot)
-            {
-                if (!_boneCache.TryGetValue(victim.skeletonProperties.bones, out var boneMapping))
-                {
-                    _boneCache[victim.skeletonProperties.bones] = boneMapping = new();
-                    foreach (var property in victim.skeletonProperties.bones)
-                    {
-                        if (property?.bone?.name != null)
-                        {
-                            boneMapping[property.area] = StringPool.Get(property.bone.name);
-                        }
-                    }
-                }
-                if (boneMapping.TryGetValue(area, out var hitBone))
-                {
-                    info.HitBone = hitBone;
-                }
-            }
-            else if (area != noHitArea)
+            if (victim.inventory.containerWear.itemList.Count > 0)
             {
                 using var obj = Facepunch.Pool.Get<PooledList<Item>>();
                 obj.AddRange(victim.inventory.containerWear.itemList);
+                bool serverUpdate = false;
                 for (int i = 0; i < obj.Count; i++)
                 {
                     Item item = obj[i];
                     if (item != null)
                     {
-                        ItemModWearable component = item.info.ItemModWearable;
-                        if (!(component == null) && component.ProtectsArea(area))
+                        ItemModWearable wearable = item.info.ItemModWearable;
+                        if (wearable != null && wearable.ProtectsArea(area))
                         {
                             item.OnAttacked(info);
+                            serverUpdate = true;
                         }
                     }
                 }
-                victim.inventory.ServerUpdate(0f);
+                if (serverUpdate)
+                {
+                    victim.inventory.ServerUpdate(0f);
+                }
+            }
+            if (config.options.ArmorDamage.Headshots && area == HitArea.Head)
+            {
+                Effect.server.Run("assets/bundled/prefabs/fx/headshot.prefab", victim, 0u, new Vector3(0f, 2f, 0f), Vector3.zero, null);
             }
         }
 
@@ -3647,8 +3642,14 @@ namespace Oxide.Plugins
 
         private object OnNpcTarget(BaseNPC2 npc, BasePlayer target) => OnNpcTargetInternal(npc, target);
 
+        private bool isServerStartingUp = true;
         private object OnNpcTargetInternal(BaseEntity npc, BasePlayer target)
         {
+            if (isServerStartingUp)
+            {
+                return true;
+            }
+
             string cacheKey = $"{npc}_{target}";
 
             if (_npcCache.TryGetValue(cacheKey, out object value))
@@ -4138,14 +4139,19 @@ namespace Oxide.Plugins
             config.schedule.ClockUpdate(out var ruleSetName, out currentBroadcastMessage);
             if (firstRun || currentRuleSet.name != ruleSetName)
             {
-                currentRuleSet = config.ruleSets.Find(r => r.name == ruleSetName);
-
-                if (currentRuleSet == null)
+                if (string.IsNullOrEmpty(ruleSetName))
                 {
-                    currentRuleSet = new(ruleSetName);  // create empty ruleset to hold name
+                    ruleSetName = config.defaultRuleSet;
                 }
 
-				ValidateCurrentDamageHook();
+                RuleSet ruleSet = config.ruleSets.Find(r => r.name == ruleSetName && r.enabled && !r.IsEmpty());
+
+                if (ruleSet != null)
+                {
+                    currentRuleSet = ruleSet;
+                }
+
+                ValidateCurrentDamageHook();
                 if (config.schedule.broadcast && !string.IsNullOrEmpty(currentBroadcastMessage))
                 {
                     Server.Broadcast(currentBroadcastMessage, GetMessage("Prefix"));
@@ -4219,6 +4225,9 @@ namespace Oxide.Plugins
 
         private class ConfigurationOptions
         {
+            [JsonProperty(PropertyName = "Armor damage (PVE)")]
+            public ArmorDamagePVE ArmorDamage = new();
+
             [JsonProperty(PropertyName = "Reflect PVP Damage Multipliers (0 = disabled, 1 = 100%)")]
             public ReflectDamagePVP Reflect = new();
 
@@ -4273,12 +4282,6 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Enable codelock anti-raiding")]
             public bool Antigrief;
 
-            [JsonProperty(PropertyName = "Enable support for npcs to cause armor damage on hit")]
-            public bool ArmorDamage;
-
-            [JsonProperty(PropertyName = "Enable npc to play headshot sound when a player is headshot")]
-            public bool Headshot;
-
             [JsonProperty(PropertyName = "Protect unlocked TC from being accessed by enemy players")]
             public bool ProtectTC;
 
@@ -4302,6 +4305,15 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Auto lock (codelock, keylock, nothing)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
             public Dictionary<string, string> AutoLock = new() { ["cupboard.tool.deployed"] = "nothing" };
+        }
+
+        private class ArmorDamagePVE
+        {
+            [JsonProperty(PropertyName = "Enable support for npcs to cause armor damage on hit")]
+            public bool Enabled;
+
+            [JsonProperty(PropertyName = "Play headshot sound when a player is headshot by an npc")]
+            public bool Headshots;
         }
 
         private class ReflectDamagePVP
@@ -5057,6 +5069,23 @@ namespace Oxide.Plugins
                                 break;
                             }
                         }
+                    }
+                    else
+                    {
+                        TimeSpan lastTime = TimeSpan.Zero;
+                        ScheduleEntry lastEntry = null;
+                        foreach (var entry in parsedEntries)
+                        {
+                            if (entry.valid && entry.isDaily)
+                            {
+                                if (lastEntry == null || entry.time > lastTime)
+                                {
+                                    lastTime = entry.time;
+                                    lastEntry = entry;
+                                }
+                            }
+                        }
+                        daily = lastEntry;
                     }
 
                     if (daily != null)
