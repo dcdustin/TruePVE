@@ -31,7 +31,7 @@ Added `Allow Thirst And Hunger Damage To Farmable Animals` (true)
 Added `Enable codelock anti-griefing` (false)
 Added `Enable support for npcs to cause armor damage on hit` (false) - uses vanilla damage and protection
 Added `Play headshot sound when a player is headshot by an npc` (false) - requires armor damage to be enabled
-Added `Protect unlocked TC from being looted by enemy players` (false)
+Added `Protect unlocked TC from being accessed by enemy players` (false)
 Added `Prevent player shield from dropping on death` (false)
 Added `Prevent player active item from dropping on death` (false)
 Added `Prevent player backpack from dropping on death (Rust backpack)` (false)
@@ -464,8 +464,9 @@ namespace Oxide.Plugins
             if (config.options.ProtectTC)
             {
                 Subscribe(nameof(OnCupboardAuthorize));
+                Subscribe(nameof(CanLootEntity));
             }
-            if (config.options.Lifts)
+            else if (config.options.Lifts)
             {
                 Subscribe(nameof(CanLootEntity));
             }
@@ -3282,12 +3283,17 @@ namespace Oxide.Plugins
 
         private object OnCupboardAuthorize(BuildingPrivlidge priv, BasePlayer player)
         {
-            if (priv == null || !priv.OwnerID.IsSteamId()) return null;
+            if (player == null || priv == null || !priv.OwnerID.IsSteamId()) return null;
             BaseLock baseLock = priv.GetSlot(BaseEntity.Slot.Lock) as BaseLock;
             if (baseLock != null && baseLock.IsLocked()) return null;
             if (IsAlly(priv.OwnerID, player.userID)) return null;
             Message(player, "Error_CannotAccessEntity");
-            return false;
+            return true;
+        }
+
+        private object CanLootEntity(BasePlayer player, BuildingPrivlidge priv)
+        {
+            return OnCupboardAuthorize(priv, player);
         }
 
         private object CanLootEntity(BasePlayer player, ModularCarGarage carLift)
