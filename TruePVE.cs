@@ -9,6 +9,7 @@ using Rust.Ai.Gen2;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
@@ -16,35 +17,9 @@ using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
 
-/*
-Added the following non-allocating API methods that take in a collection parameter
-bool RemoveMappings(List<string> keys, List<string> results = null)
-void GetMappingsDictionaryNoAlloc(Dictionary<string, string> dict)
-void GetMappingsListNoAlloc(List<string> list)
-
-Fixed issue with evaluation of mounted damage
-Fixed schedule to revert to the prior entry when there isn’t a valid current entry
-Fixed damage to NPCPlayer when no initiator is set
-Blocked animals from targeting any players during server restarts
-Blocked RC turret damage when TurretsIgnorePlayers flag is added
-Added `Allow Thirst And Hunger Damage To Farmable Animals` (true)
-Added `Enable codelock anti-griefing` (false)
-Added `Enable support for npcs to cause armor damage on hit` (false) - uses vanilla damage and protection
-Added `Play headshot sound when a player is headshot by an npc` (false) - requires armor damage to be enabled
-Added `Protect unlocked TC from being accessed by enemy players` (false)
-Added `Prevent player shield from dropping on death` (false)
-Added `Prevent player active item from dropping on death` (false)
-Added `Prevent player backpack from dropping on death (Rust backpack)` (false)
-Added `Prevent players from using enemy car lifts` (false)
-Added `Enable support to allow adding locks to various containers` (false) - includes shutter
-Added `Exceptions for locks to various containers option`
-Added `Auto lock (codelock, keylock, nothing)` - this is exclusively for storage containers only atm (TC is included, it is a storage container)
-Changed `Block Decay Damage To Vehicles` to allow horse to decay to 90% health in order to produce dung.
-*/
-
 namespace Oxide.Plugins
 {
-    [Info("TruePVE", "nivex", "2.2.927")]
+    [Info("TruePVE", "nivex", "2.3.4")]
     [Description("Improvement of the default Rust PVE behavior")]
     // Thanks to the original author, ignignokt84.
     internal class TruePVE : RustPlugin
@@ -158,121 +133,6 @@ namespace Oxide.Plugins
         private readonly HashSet<string> exclusionLocationsSet = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<ulong, List<PlayerExclusion>> playerDelayExclusions = new();
         private readonly Dictionary<string, RuleSet> ruleSetByNameDictionary = new(StringComparer.OrdinalIgnoreCase);
-        private readonly TimedCache<bool?> _npcCache = new (TimeSpan.FromMinutes(1));
-
-        public class TimedCache<T>
-        {
-            public readonly struct Entry
-            {
-                public readonly T Value;
-                public readonly DateTime Timestamp;
-
-                public Entry(T value)
-                {
-                    Value = value;
-                    Timestamp = DateTime.UtcNow;
-                }
-            }
-
-            private readonly Dictionary<string, Entry> _cache;
-            private readonly TimeSpan _cacheDuration;
-            private readonly List<string> _remove = new();
-            private readonly int _maxCapacity;
-
-            public TimedCache(TimeSpan cacheDuration, int maxCapacity = 500)
-            {
-                _cacheDuration = cacheDuration;
-                _maxCapacity = maxCapacity;
-                _cache = new(maxCapacity);
-            }
-
-            public bool TryGetValue(string key, out object value)
-            {
-                if (_cache.TryGetValue(key, out Entry entry))
-                {
-                    if (DateTime.UtcNow - entry.Timestamp < _cacheDuration)
-                    {
-                        value = entry.Value;
-                        return true;
-                    }
-                    else
-                    {
-                        _cache.Remove(key);
-                    }
-                }
-
-                value = null;
-                return false;
-            }
-
-            public T Set(string key, T value)
-            {
-                if (_cache.Count >= _maxCapacity)
-                {
-                    RemoveOldest();
-                }
-
-                _cache[key] = new(value);
-
-                if (_cache.Count == 1)
-                {
-                    InvokeHandler.Instance.InvokeRepeating(OnTick, 1f, 1f);
-                }
-
-                return value;
-            }
-
-            private void OnTick()
-            {
-                var now = DateTime.UtcNow;
-
-                foreach (var kvp in _cache)
-                {
-                    if (now - kvp.Value.Timestamp >= _cacheDuration)
-                    {
-                        _remove.Add(kvp.Key);
-                    }
-                }
-
-                if (_remove.Count > 0)
-                {
-                    foreach (var key in _remove)
-                    {
-                        _cache.Remove(key);
-                    }
-
-                    if (_cache.Count == 0)
-                    {
-                        CancelInvoke();
-                    }
-
-                    _remove.Clear();
-                }
-            }
-
-            private void RemoveOldest()
-            {
-                KeyValuePair<string, Entry> oldest = default;
-                bool isFirst = true;
-
-                foreach (var kvp in _cache)
-                {
-                    if (isFirst || kvp.Value.Timestamp < oldest.Value.Timestamp)
-                    {
-                        oldest = kvp;
-                        isFirst = false;
-                    }
-                }
-
-                _cache.Remove(oldest.Key);
-            }
-
-            public void CancelInvoke()
-            {
-                InvokeHandler.Instance.CancelInvoke(OnTick);
-                _cache.Clear();
-            }
-        }
 
         private class PlayerExclusion : Pool.IPooled
         {
@@ -305,7 +165,6 @@ namespace Oxide.Plugins
         {
             IsUnloading = true;
             scheduleUpdateTimer?.Destroy();
-            _npcCache.CancelInvoke();
             SaveData();
         }
 
@@ -347,17 +206,21 @@ namespace Oxide.Plugins
 
         private void Init()
         {
-            if (!config.options.NoShieldDrop)
+            if (!config.options.Loot.NoShieldDrop)
             {
                 Unsubscribe(nameof(OnPlayerActiveShieldDrop));
             }
-            if (!config.options.NoActiveItemDrop)
+            if (!config.options.Loot.NoActiveItemDrop)
             {
                 Unsubscribe(nameof(OnPlayerDropActiveItem));
             }
-            if (!config.options.NoRustBackpackDrop)
+            if (!config.options.Loot.NoRustBackpackDrop)
             {
                 Unsubscribe(nameof(OnBackpackDrop));
+            }
+            if (!config.BlockSprayCanInSafeZones)
+            {
+                Unsubscribe(nameof(OnSprayCreate));
             }
             Unsubscribe(nameof(CanLootEntity));
             Unsubscribe(nameof(OnCodeEntered));
@@ -368,6 +231,7 @@ namespace Oxide.Plugins
             Unsubscribe(nameof(OnEntitySpawned));
             Unsubscribe(nameof(OnEntityEnter));
             Unsubscribe(nameof(OnTurretTarget));
+            Unsubscribe(nameof(OnTimedExplosiveExplode));
             Unsubscribe(nameof(OnWallpaperRemove));
             Unsubscribe(nameof(OnEntityTakeDamage));
             Unsubscribe(nameof(OnPlayerConnected));
@@ -394,6 +258,10 @@ namespace Oxide.Plugins
             LoadData();
         }
 
+        private bool IsAnimalsIgnoringSleepers() => animalsIgnoreSleepers || config.ruleSets.Exists(ruleSet => ruleSet.HasFlag(RuleFlags.AnimalsIgnoreSleepers));
+        
+        private bool IsAnimalsIgnoringSleepers(RuleSet ruleSet) => animalsIgnoreSleepers || ruleSet.HasFlag(RuleFlags.AnimalsIgnoreSleepers);
+        
         private void OnServerInitialized(bool isStartup)
         {
             isServerStartingUp = false;
@@ -410,7 +278,7 @@ namespace Oxide.Plugins
             {
                 TimerLoop(true);
             }
-            if (!animalsIgnoreSleepers && !config.ruleSets.Exists(ruleSet => ruleSet.HasFlag(RuleFlags.AnimalsIgnoreSleepers)))
+            if (!IsAnimalsIgnoringSleepers())
             {
                 Unsubscribe(nameof(OnNpcTarget));
             }
@@ -456,13 +324,14 @@ namespace Oxide.Plugins
             if (config.wallpaper)
             {
                 Subscribe(nameof(OnWallpaperRemove));
+                Subscribe(nameof(OnTimedExplosiveExplode));
             }
-            if (config.options.ProtectTC)
+            if (config.options.Loot.ProtectTC)
             {
                 Subscribe(nameof(OnCupboardAuthorize));
                 Subscribe(nameof(CanLootEntity));
             }
-            else if (config.options.Lifts)
+            else if (config.options.Loot.Lifts)
             {
                 Subscribe(nameof(CanLootEntity));
             }
@@ -724,10 +593,9 @@ namespace Oxide.Plugins
             if (animalsIgnoreSleepers)
             {
                 animalsIgnoreSleepers = false;
-                if (!config.ruleSets.Exists(ruleSet => (ruleSet._flags & RuleFlags.AnimalsIgnoreSleepers) != 0))
+                if (!IsAnimalsIgnoringSleepers())
                 {
                     Unsubscribe(nameof(OnNpcTarget));
-                    _npcCache.CancelInvoke();
                 }
                 user.Reply("Sleepers are no longer protected from animals.");
             }
@@ -856,7 +724,7 @@ namespace Oxide.Plugins
         #endregion
 
         #region Configuration/Data
-        private bool _playersTriggerOption, _playersHurtOption, _canKillOfflinePlayerEnabled, _pvpReflectionEnabled, _allowKillingSleepersEnabled, _twigOutputHandlerEnabled;
+        private bool _playersTriggerOption, _playersHurtOption, _canKillOfflinePlayerEnabled, _pvpReflectionEnabled, _allowKillingSleepersEnabled, _blockOutputHandlerEnabled;
 
         // load config
         protected override void LoadConfig()
@@ -928,27 +796,77 @@ namespace Oxide.Plugins
                 BuildDefaultRuleset();
                 Puts("Loaded default rulesets (no rulesets were configured)");
             }
-            for (int i = 0; i < config.groups.Count; i++)
-            {
-                if (string.IsNullOrEmpty(config.groups[i].name))
-                {
-                    config.groups[i].name = $"group{i}";
-                }
-                if (config.groups[i].name == "ridablehorses" && config.groups.Count == 1 && config.groups[0].members.Equals("RidableHorse"))
-                {
-                    config.groups[i].members = "RidableHorse2";
-                }
-            }
+            TryUpdateConfig();
             config.configVersion = Version.ToString();
             CheckMappings();
             BuildRuleSetDictionary();
             BuildExclusionMappings();
             _allowKillingSleepersEnabled = config.AllowKillingSleepersAlly || config.AllowKillingSleepers || config.AllowKillingSleepersAuthorization || config.AllowKillingSleepersIds.Exists(x => x.IsSteamId());
-            _twigOutputHandlerEnabled = config.options.BlockHandler.Any; 
+            _blockOutputHandlerEnabled = config.options.BlockHandler.Any; 
             _pvpReflectionEnabled = config.options.Reflect.Any;
             _canKillOfflinePlayerEnabled = config.AllowKillingSleepersHoursOffline > 0;
             _playersTriggerOption = config.PlayersTriggerTraps || config.PlayersTriggerTurrets;
             _playersHurtOption = config.PlayersHurtTraps || config.PlayersHurtTurrets;
+        }
+
+        private void TryUpdateConfig()
+        {
+            if (!TryParseVersionNumber(config.configVersion, out var vn) || vn >= Version)
+                return;
+
+            Dictionary<string, string> updates = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["npcs"] = "SnakeHazard",
+                ["dispensers"] = "VineSwingingTree"
+            };
+
+            for (int i = 0; i < config.groups.Count; i++)
+            {
+                var group = config.groups[i];
+                if (string.IsNullOrWhiteSpace(group.members))
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrEmpty(group.name))
+                {
+                    group.name = $"group{i}";
+                    continue;
+                }
+
+                if (group.name == "ridablehorses" && group.members.Equals("RidableHorse2"))
+                {
+                    group.members = "RidableHorse";
+                    continue;
+                }
+
+                if (updates.TryGetValue(group.name, out var update) && !ContainedInGroups(update))
+                {
+                    group.members = $"{group.members.TrimEnd(',', ' ')}{", "}{update}";
+                    continue;
+                }
+            }
+        }
+
+        private bool ContainedInGroups(string member) => config.groups.Exists(g => g.members.Contains(member, CompareOptions.OrdinalIgnoreCase) || g.exclusions.Contains(member, CompareOptions.OrdinalIgnoreCase));
+
+        private bool TryParseVersionNumber(string input, out VersionNumber version)
+        {
+            version = default;
+            if (string.IsNullOrWhiteSpace(input))
+                return false;
+
+            var parts = input.Split('.');
+            if (parts.Length != 3)
+                return false;
+
+            if (int.TryParse(parts[0], out int major) && int.TryParse(parts[1], out int minor) && int.TryParse(parts[2], out int patch))
+            {
+                version = new(major, minor, patch);
+                return true;
+            }
+
+            return false;
         }
 
         // rebuild mappings
@@ -1098,7 +1016,7 @@ namespace Oxide.Plugins
 
             config.groups.Add(new("ridablehorses")
             {
-                members = "RidableHorse2"
+                members = "RidableHorse"
             });
 
             config.groups.Add(new("cars")
@@ -1123,7 +1041,7 @@ namespace Oxide.Plugins
 
             config.groups.Add(new("npcs")
             {
-                members = "ch47scientists.entity, BradleyAPC, CustomScientistNpc, ScarecrowNPC, HumanNPC, NPCPlayer, ScientistNPC, TunnelDweller, SimpleShark, UnderwaterDweller, ZombieNPC"
+                members = "ch47scientists.entity, BradleyAPC, CustomScientistNpc, SnakeHazard, ScarecrowNPC, HumanNPC, NPCPlayer, ScientistNPC, TunnelDweller, SimpleShark, UnderwaterDweller, ZombieNPC"
             });
 
             config.groups.Add(new("players")
@@ -1133,7 +1051,7 @@ namespace Oxide.Plugins
 
             config.groups.Add(new("resources")
             {
-                members = "ResourceEntity, TreeEntity, OreResourceEntity, LootContainer, NaturalBeehive",
+                members = "ResourceEntity, TreeEntity, OreResourceEntity, LootContainer, NaturalBeehive, VineSwingingTree",
                 exclusions = "hobobarrel.deployed"
             });
 
@@ -1320,6 +1238,14 @@ namespace Oxide.Plugins
 
         private bool IsEnabled() => tpveEnabled;
 
+        private void OnTimedExplosiveExplode(TimedExplosive explosive, Vector3 explosionFxPos)
+        {
+            if (explosive != null)
+            {
+                explosive.splashWallpaperThroughWalls = false;
+            }
+        }
+
         private object OnWallpaperRemove(BuildingBlock block, int side)
         {
             if (block == null || block.IsDestroyed)
@@ -1330,7 +1256,7 @@ namespace Oxide.Plugins
             {
                 case 0:
                     {
-                        if (block.wallpaperHealth <= 0f)
+                        if (block.wallpaperID != 0 && block.wallpaperHealth <= 0f)
                         {
                             using var entityLocations = GetLocationKeys(block);
                             if (CheckExclusion(entityLocations, entityLocations, trace))
@@ -1346,7 +1272,7 @@ namespace Oxide.Plugins
                     }
                 case 1:
                     {
-                        if (block.wallpaperHealth2 <= 0f)
+                        if (block.wallpaperID2 != 0 && block.wallpaperHealth2 <= 0f)
                         {
                             using var entityLocations = GetLocationKeys(block);
                             if (CheckExclusion(entityLocations, entityLocations, trace))
@@ -1409,6 +1335,10 @@ namespace Oxide.Plugins
             if (!AllowDamage(entity, info))
             {
                 if (trace) LogTrace();
+                if (info.Weapon is BlowPipeWeapon)
+                {
+                    info.HitEntity = null;
+                }
                 info.damageTypes?.Clear();
                 info.DidHit = false;
                 info.DoHitEffects = false;
@@ -1610,8 +1540,6 @@ namespace Oxide.Plugins
             return attacker.GetBuildingPrivilege(heli.WorldSpaceBounds(), true) is BuildingPrivlidge priv && priv.AnyAuthed() && priv.IsAuthed(attacker);
         }
 
-        private const HitArea noHitArea = (HitArea)(-1);
-
         // determines if an entity is "allowed" to take damage
         private bool AllowDamage(BaseEntity entity, HitInfo info)
         {
@@ -1638,7 +1566,7 @@ namespace Oxide.Plugins
 
             if (Interface.CallHook("CanEntityTakeDamage", new object[] { entity, info }) is bool val)
             {
-                if (val && config.options.ArmorDamage.Enabled && isAttacker && !isAtkId && isVicId && info.boneArea == noHitArea)
+                if (val && config.options.ArmorDamage.Enabled && isAttacker && !isAtkId && isVicId)
                 {
                     HandleHitArea(victim, info);
                 }
@@ -1652,7 +1580,7 @@ namespace Oxide.Plugins
                 return true;
             }
 
-            if (config.options.ArmorDamage.Enabled && isAttacker && !isAtkId && isVicId && info.boneArea == noHitArea)
+            if (config.options.ArmorDamage.Enabled && isAttacker && !isAtkId && isVicId)
             {
                 HandleHitArea(victim, info);
             }
@@ -1713,9 +1641,9 @@ namespace Oxide.Plugins
 
             if (damageType == DamageType.Decay)
             {
-                if (entity is BaseVehicle)
+                if (entity is BaseVehicle v)
                 {
-                    return entity is RidableHorse2 horse && horse.healthFraction > 0.9f ? true : !config.BlockDecayDamageToVehicles;
+                    return entity is HitchTrough.IHitchable && v.healthFraction > 0.9f ? true : !config.BlockDecayDamageToVehicles;
                 }
                 return true;
             }
@@ -1803,9 +1731,9 @@ namespace Oxide.Plugins
                         if (multiplier != 0 && !IsAlly(victim.userID, attacker.userID))
                         {
                             float reflectedDamage = damageAmount * multiplier;
-                            if (!selfDamageFlag) damageType = DamageType.Radiation;
-                            if (trace) Trace($"Reflect damage ({reflectedDamage} {damageType})", 1);
-                            attacker.Hurt(reflectedDamage, damageType, attacker, config.options.Reflect.Protection);
+                            DamageType reflectType = selfDamageFlag ? damageType : DamageType.Radiation;
+                            if (trace) Trace($"Reflect damage ({reflectedDamage} {reflectType})", 1);
+                            attacker.Hurt(reflectedDamage, reflectType, attacker, config.options.Reflect.Protection);
                         }
                     }
 
@@ -2130,31 +2058,28 @@ namespace Oxide.Plugins
 
                     if (block.grade == BuildingGrade.Enum.Twigs && (_flags & RuleFlags.TwigDamage) != 0)
                     {
-                        bool isAllowed = ((_flags & RuleFlags.TwigDamageRequiresOwnership) == 0) || IsAlly(block.OwnerID, attacker.userID) || IsAuthed(block, attacker);
-                        if (trace)
-                        {
-                            string action = isAllowed ? "allow" : "block";
-                            Trace($"Initiator is player and target is twig block, with TwigDamage flag set; {action} and return", 1);
-                        }
-                        if (_twigOutputHandlerEnabled && isAtkId && !isAllowed) TwigOutputHandler(block, damageType, damageAmount, attacker, selfDamageFlag);
+                        bool isAllowed = HasBlockAccess(block, attacker, (_flags & RuleFlags.TwigDamageRequiresOwnership) != 0);
+                        if (!isAllowed && _blockOutputHandlerEnabled) HandleBlockOutput(block, damageType, damageAmount, attacker, selfDamageFlag);
+                        if (trace) Trace($"Initiator is player and target is twig block, with TwigDamage flag set; {(isAllowed ? "allow" : "block")} and return", 1);
                         return isAllowed;
                     }
 
                     if (block.grade == BuildingGrade.Enum.Wood && (_flags & RuleFlags.WoodenDamage) != 0)
                     {
-                        bool isAllowed = ((_flags & RuleFlags.WoodenDamageRequiresOwnership) == 0) || IsAlly(block.OwnerID, attacker.userID) || IsAuthed(block, attacker);
-                        if (trace)
-                        {
-                            string action = isAllowed ? "allow" : "block";
-                            Trace($"Initiator is player and target is wood block, with WoodenDamage flag set; {action} and return", 1);
-                        }
-                        if (_twigOutputHandlerEnabled && isAtkId && !isAllowed) TwigOutputHandler(block, damageType, damageAmount, attacker, selfDamageFlag);
+                        bool isAllowed = HasBlockAccess(block, attacker, (_flags & RuleFlags.WoodenDamageRequiresOwnership) != 0);
+                        if (!isAllowed && _blockOutputHandlerEnabled) HandleBlockOutput(block, damageType, damageAmount, attacker, selfDamageFlag);
+                        if (trace) Trace($"Initiator is player and target is wooden block, with WoodenDamage flag set; {(isAllowed ? "allow" : "block")} and return", 1);
                         return isAllowed;
                     }
 
-                    if (_twigOutputHandlerEnabled && isAtkId && !HandleBlockGrade(block, attacker, damageType, damageAmount, selfDamageFlag))
+                    if (_blockOutputHandlerEnabled)
                     {
-                        return false;
+                        DamageResult result = HandleBlockGrade(block, attacker, damageType, damageAmount, selfDamageFlag);
+                        if (result != DamageResult.None)
+                        {
+                            if (trace) Trace($"Initiator is player and target is {block.grade} block, with damage option set; {(result == DamageResult.Allow ? "allow" : "block")} and return", 1);
+                            return result == DamageResult.Allow;
+                        }
                     }
                 }
 
@@ -2176,7 +2101,7 @@ namespace Oxide.Plugins
                     return false;
                 }
 
-                if (entity.OwnerID == 0 && entity is AdvancedChristmasLights)
+                if (entity.OwnerID == 0 && entity is ChristmasLights)
                 {
                     if (trace) Trace($"Entity is christmas lights; block and return", 1);
                     return false;
@@ -2318,8 +2243,13 @@ namespace Oxide.Plugins
                 for (int i = 0; i < obj.Count; i++)
                 {
                     Item item = obj[i];
-                    if (item != null)
+                    if (item != null && !item.isBroken)
                     {
+                        if (config.options.ArmorDamage.ImmuneSkins.Contains(item.skin))
+                        {
+                            info.HitBone = 0u; // prevent immune skins from taking damage from other plugins
+                            continue;
+                        }
                         ItemModWearable wearable = item.info.ItemModWearable;
                         if (wearable != null && wearable.ProtectsArea(area))
                         {
@@ -2330,6 +2260,7 @@ namespace Oxide.Plugins
                 }
                 if (serverUpdate)
                 {
+                    info.HitBone = 0u; // prevent double armor damage
                     victim.inventory.ServerUpdate(0f);
                 }
             }
@@ -2351,11 +2282,18 @@ namespace Oxide.Plugins
             return m;
         }
 
+        private bool HasBlockAccess(BuildingBlock block, BasePlayer attacker, bool requiresOwner) 
+        { 
+            if (IsAlly(block.OwnerID, attacker.userID)) return true; 
+            return (!requiresOwner || IsAuthed(block, attacker)) && (!config.options.BlockHandler.Online || BasePlayer.FindByID(block.OwnerID) == null); 
+        }
 
         private readonly BuildingGrade.Enum[] GradeEnums = new BuildingGrade.Enum[] { BuildingGrade.Enum.Twigs, BuildingGrade.Enum.Wood, BuildingGrade.Enum.Stone, BuildingGrade.Enum.Metal, BuildingGrade.Enum.TopTier };
 
-        private bool HandleBlockGrade(BuildingBlock block, BasePlayer attacker, DamageType damageType, float damageAmount, bool selfDamageFlag)
+        private DamageResult HandleBlockGrade(BuildingBlock block, BasePlayer attacker, DamageType damageType, float damageAmount, bool selfDamageFlag)
         {
+            DamageResult result = DamageResult.None;
+
             foreach (var grade in GradeEnums)
             {
                 if (block.grade == grade)
@@ -2373,31 +2311,27 @@ namespace Oxide.Plugins
                         continue;
                     }
 
-                    bool isAllowed = IsAlly(block.OwnerID, attacker.userID) || IsAuthed(block, attacker);
+                    result = HasBlockAccess(block, attacker, true) ? DamageResult.Allow : DamageResult.Block;
 
                     if (trace)
                     {
-                        string action = isAllowed ? $"{grade} continue checks" : "block and return";
+                        string action = result == DamageResult.Allow ? $"{grade} continue checks" : "block and return";
                         Trace($"Initiator is player and target is {grade} block, {action}", 1);
                     }
 
-                    if (!isAllowed)
+                    if (result == DamageResult.Block)
                     {
-                        TwigOutputHandler(block, damageType, damageAmount, attacker, selfDamageFlag);
-                        return false;
+                        HandleBlockOutput(block, damageType, damageAmount, attacker, selfDamageFlag);
+                        return result;
                     }
                 }
             }
 
-            return true;
+            return result;
         }
 
-        private void TwigOutputHandler(BuildingBlock block, DamageType damageType, float damageAmount, BasePlayer attacker, bool selfDamageFlag)
+        private void HandleBlockOutput(BuildingBlock block, DamageType damageType, float damageAmount, BasePlayer attacker, bool selfDamageFlag)
         {
-            if (config.options.BlockHandler.Online && BasePlayer.FindByID(block.OwnerID) == null)
-            {
-                return;
-            }
             if (config.options.BlockHandler.Log)
             {
                 string grade = block.grade.ToString();
@@ -2419,7 +2353,10 @@ namespace Oxide.Plugins
                     damageType = DamageType.Radiation;
                 }
 
-                attacker.Hurt(damageAmount, damageType, attacker, config.options.BlockHandler.ReflectDamageProtection);
+                bool t = trace;
+                trace = false;
+                attacker.Hurt(reflectedDamage, damageType, attacker, config.options.BlockHandler.ReflectDamageProtection);
+                trace = t;
 
                 if (config.options.BlockHandler.Log)
                 {
@@ -2535,7 +2472,7 @@ namespace Oxide.Plugins
                 }
                 return !val;
             }
-            if (entity is RidableHorse2)
+            if (entity is HitchTrough.IHitchable)
             {
                 bool val = (ruleSet._flags & RuleFlags.NoHeliDamageRidableHorses) != 0;
                 if (trace)
@@ -2791,7 +2728,7 @@ namespace Oxide.Plugins
                 Trace($"Target EntityGroup matches: {action2}", 2);
             }
 
-            return ruleSet.Evaluate(this, e0Groups, e1Groups, returnDefaultValue);
+            return ruleSet.Evaluate(this, attacker, e0Groups, entity, e1Groups, returnDefaultValue);
         }
 
         // checks an entity to see if it has a lock
@@ -2972,7 +2909,7 @@ namespace Oxide.Plugins
         }
 
 #if OXIDE_PUBLICIZED || CARBON
-        private void OnEntitySpawned(RidableHorse2 horse)
+        private void OnEntitySpawned(RidableHorse horse)
         {
             if (config.PreventRagdolling && horse != null)
             {
@@ -3004,7 +2941,7 @@ namespace Oxide.Plugins
             if (codeLock == null || player == null || player.limitNetworking) 
                 return null;
             var parent = codeLock.GetParentEntity() as BaseEntity;
-            if (parent.OwnerID.IsSteamId() && !IsAlly(player.userID, parent.OwnerID))
+            if (parent != null && parent.OwnerID.IsSteamId() && !IsAlly(player.userID, parent.OwnerID))
             {
                 Effect.server.Run(codeLock.effectDenied.resourcePath, codeLock, 0u, Vector3.zero, Vector3.forward);
                 Effect.server.Run(codeLock.effectShock.resourcePath, codeLock, 0u, Vector3.zero, Vector3.forward);
@@ -3021,11 +2958,11 @@ namespace Oxide.Plugins
 
         private void AllowLocksOnContainers()
         {
-            if (config.options.Locks)
+            if (config.options.Loot.Locks)
             {
                 ServerMgr.Instance.StartCoroutine(LockCo());
             }
-            if (config.options.Antigrief)
+            if (config.options.Loot.Antigrief)
             {
                 Subscribe(nameof(OnCodeEntered));
             }
@@ -3055,7 +2992,7 @@ namespace Oxide.Plugins
 
         private void CreateKeyLock(BaseEntity entity, ulong userid)
         {
-            if (GameManager.server.CreateEntity(StringPool.Get(2106860026)) is KeyLock keyLock)
+            if (GameManager.server.CreateEntity(StringPool.Get(2106860026)) is KeyLock keyLock && keyLock != null)
             {
                 keyLock.gameObject.Identity();
                 keyLock.SetParent(entity, entity.GetSlotAnchorName(BaseEntity.Slot.Lock));
@@ -3069,7 +3006,7 @@ namespace Oxide.Plugins
 
         private void CreateCodeLock(BaseEntity entity, ulong userid)
         {
-            if (GameManager.server.CreateEntity(StringPool.Get(3518824735)) is CodeLock codeLock)
+            if (GameManager.server.CreateEntity(StringPool.Get(3518824735)) is CodeLock codeLock && codeLock != null)
             {
                 codeLock.gameObject.Identity();
                 codeLock.SetParent(entity, entity.GetSlotAnchorName(BaseEntity.Slot.Lock));
@@ -3091,7 +3028,7 @@ namespace Oxide.Plugins
 
         private void OnEntitySpawned(Door door)
         {
-            if (config.options.Locks && door != null && !door.canTakeLock && door.OwnerID.IsSteamId() && doors.Contains(door.ShortPrefabName))
+            if (config.options.Loot.Locks && door != null && !door.canTakeLock && door.OwnerID.IsSteamId() && doors.Contains(door.ShortPrefabName))
             {
                 door.canTakeLock = true;
             }
@@ -3099,41 +3036,59 @@ namespace Oxide.Plugins
 
         private void OnEntitySpawned(StorageContainer container)
         {
-            if (config.options.Locks && container != null && !container.isLockable && container.OwnerID.IsSteamId())
+            if (container == null || !container.OwnerID.IsSteamId())
+                return;
+
+            if (config.options.Loot.Locks && !container.isLockable)
             {
-                container.isLockable = !config.options.NoLocks.Contains(container.ShortPrefabName) && !config.options.NoLocks.Contains(GetTypeName(container));
+                container.isLockable = !config.options.Loot.NoLocks.Contains(container.ShortPrefabName) && !config.options.Loot.NoLocks.Contains(GetTypeName(container));
             }
 
-            if (config.options.AutoLock.TryGetValue(container.ShortPrefabName, out string type) || config.options.AutoLock.TryGetValue(GetTypeName(container), out type))
+            if (config.options.Loot.AutoLock.TryGetValue(container.ShortPrefabName, out string type) || config.options.Loot.AutoLock.TryGetValue(GetTypeName(container), out type))
             {
                 if (type.Equals("nothing", StringComparison.OrdinalIgnoreCase))
                     return;
 
-                container.Invoke(() =>
-                {
-                    if (container.IsDestroyed)
-                        return;
-
-                    var slot = container.GetSlot(BaseEntity.Slot.Lock);
-
-                    if (slot != null)
-                        return;
-
-                    if (type == "codelock")
-                    {
-                        CreateCodeLock(container, container.OwnerID);
-                    }
-                    else if (type == "keylock")
-                    {
-                        CreateKeyLock(container, container.OwnerID);
-                    }
-                }, 0.3f);
+                container.Invoke(() => TryCreateLock(container, type), 0.3f);
             }
+        }
+
+        private void OnEntitySpawned(ContainerIOEntity container)
+        {
+            if (config.options.Loot.AutoLock.TryGetValue(container.ShortPrefabName, out string type) || config.options.Loot.AutoLock.TryGetValue(GetTypeName(container), out type))
+            {
+                if (type.Equals("nothing", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                container.Invoke(() => TryCreateLock(container, type), 0.3f);
+            }
+        }
+
+        private bool TryCreateLock(BaseEntity container, string type)
+        {
+            if (container.IsDestroyed)
+                return false;
+
+            var slot = container.GetSlot(BaseEntity.Slot.Lock);
+
+            if (slot != null)
+                return false;
+
+            if (type == "codelock")
+            {
+                CreateCodeLock(container, container.OwnerID);
+            }
+            else if (type == "keylock")
+            {
+                CreateKeyLock(container, container.OwnerID);
+            }
+
+            return true;
         }
 
         private void OnEntitySpawned(BaseLock baseLock)
         {
-            if (!config.options.Locks || baseLock == null)
+            if (!config.options.Loot.Locks || baseLock == null)
             {
                 return;
             }
@@ -3144,13 +3099,13 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (config.options.NoLocks.Count > 0)
+            if (config.options.Loot.NoLocks.Count > 0)
             {
-                if (config.options.NoLocks.Contains(entity.ShortPrefabName))
+                if (config.options.Loot.NoLocks.Contains(entity.ShortPrefabName))
                 {
                     return;
                 }
-                if (config.options.NoLocks.Contains(GetTypeName(entity)))
+                if (config.options.Loot.NoLocks.Contains(GetTypeName(entity)))
                 {
                     return;
                 }
@@ -3320,13 +3275,22 @@ namespace Oxide.Plugins
 
         #endregion Locks
 
+        private object OnSprayCreate(SprayCan sc, Vector3 pos, Quaternion rot)
+        {
+            if (sc == null || sc.IsDestroyed) return null;
+            BasePlayer player = sc.GetOwnerPlayer();
+            if (player == null || player.IsDestroyed) return null;
+            if (player.InSafeZone()) return true;
+            return null;
+        }
+
         private void OnEntitySpawned(BaseOven oven)
         {
-            if (config.options.disableBaseOvenSplash && oven != null)
+            if (config.options.disableBaseOvenSplash && oven != null && oven.OwnerID.IsSteamId())
             {
                 oven.disabledBySplash = false;
             }
-            if (config.options.Locks && oven != null && oven is StorageContainer c)
+            if (config.options.Loot.Locks && oven != null && oven is StorageContainer c)
             {
                 OnEntitySpawned(c);
             }
@@ -3492,15 +3456,16 @@ namespace Oxide.Plugins
                 return val ? (object)null : true;
             }
 
-            if (config.PlayersTriggerTurrets && entity.OwnerID == 0uL && target.userID.IsSteamId() && (entity is FlameTurret or AutoTurret) && !entity.HasParent())
-            {
-                return null;
-            }
-
             RuleSet ruleSet = GetRuleSet(target, entity);
 
             if (ruleSet == null)
             {
+                return null;
+            }
+
+            if (config.PlayersTriggerTurrets && entity.OwnerID == 0uL && target.userID.IsSteamId() && (entity is FlameTurret or AutoTurret) && !entity.HasParent())
+            {
+                if (entity is NPCAutoTurret && (ruleSet._flags & RuleFlags.SafeZoneTurretsIgnorePlayers) != 0 && target.InSafeZone()) return true;
                 return null;
             }
 
@@ -3657,6 +3622,7 @@ namespace Oxide.Plugins
         private object OnNpcTarget(BaseNPC2 npc, BasePlayer target) => OnNpcTargetInternal(npc, target);
 
         private bool isServerStartingUp = true;
+
         private object OnNpcTargetInternal(BaseEntity npc, BasePlayer target)
         {
             if (isServerStartingUp)
@@ -3664,21 +3630,24 @@ namespace Oxide.Plugins
                 return true;
             }
 
-            string cacheKey = $"{npc}_{target}";
-
-            if (_npcCache.TryGetValue(cacheKey, out object value))
+            if (target == null)
             {
-                return value;
+                return true;
             }
 
-            if (npc == null || target == null || !target.userID.IsSteamId() || !target.IsSleeping())
+            if (!target.userID.IsSteamId() || !target.IsSleeping())
             {
-                return _npcCache.Set(cacheKey, null);
+                return null;
+            }
+
+            if (npc == null)
+            {
+                return true;
             }
 
             RuleSet ruleSet = GetRuleSet(target, npc);
 
-            if (ruleSet == null || !animalsIgnoreSleepers && (ruleSet._flags & RuleFlags.AnimalsIgnoreSleepers) == 0)
+            if (ruleSet == null || !IsAnimalsIgnoringSleepers(ruleSet))
             {
                 return null;
             }
@@ -3691,11 +3660,11 @@ namespace Oxide.Plugins
                 // check for exclusion zones (zones with no rules mapped)
                 if (CheckExclusion(entityLocations, initiatorLocations, false))
                 {
-                    return _npcCache.Set(cacheKey, null);
+                    return null;
                 }
             }
 
-            return _npcCache.Set(cacheKey, true);
+            return true;
         }
 
         private readonly Dictionary<uint, string> _typeNameLookup = new();
@@ -3708,7 +3677,12 @@ namespace Oxide.Plugins
 
             if (!_typeNameLookup.TryGetValue(entity.prefabID, out string name))
             {
-                _typeNameLookup[entity.prefabID] = name = entity.GetType().Name;
+                BaseEntity prefab = entity.LookupPrefab();
+                if (prefab == null)
+                {
+                    prefab = entity;
+                }
+                _typeNameLookup[entity.prefabID] = name = prefab.GetType().Name;
             }
 
             return name;
@@ -3954,7 +3928,7 @@ namespace Oxide.Plugins
         {
             if (!string.IsNullOrEmpty(key) && config.mappings.Remove(key))
             {
-                if (_removeMappingTimer != null) _removeMappingTimer.Reset();
+                if (_removeMappingTimer is { Destroyed: false }) _removeMappingTimer.Reset();
                 else _removeMappingTimer = timer.Once(1f, SaveConfig);
                 SetUseZones();
                 return true;
@@ -4174,7 +4148,9 @@ namespace Oxide.Plugins
             }
 
             if (config.schedule.enabled)
+            {
                 scheduleUpdateTimer = timer.Once(config.schedule.useRealtime ? 30f : 3f, () => TimerLoop());
+            }
         }
 
         private void ValidateCurrentDamageHook()
@@ -4197,7 +4173,7 @@ namespace Oxide.Plugins
             }
         }
 
-		#endregion
+        #endregion
 
         #region Subclasses
         // configuration and data storage container
@@ -4234,13 +4210,16 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Multiplier Allows Armor Protection")]
             public bool ReflectDamageProtection = true;
 
-            internal bool Any => Log || Notify || ReflectDamageMultiplier > 0f || Wood || Stone || Metal || HQM;
+            internal bool Any => Log || Notify || ReflectDamageMultiplier > 0f || Twig || Wood || Stone || Metal || HQM;
         }
 
         private class ConfigurationOptions
         {
             [JsonProperty(PropertyName = "Armor damage (PVE)")]
             public ArmorDamagePVE ArmorDamage = new();
+
+            [JsonProperty(PropertyName = "Loot")]
+            public LootSupport Loot = new();
 
             [JsonProperty(PropertyName = "Reflect PVP Damage Multipliers (0 = disabled, 1 = 100%)")]
             public ReflectDamagePVP Reflect = new();
@@ -4292,8 +4271,20 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Allow Thirst And Hunger Damage To Farmable Animals")]
             public bool FarmableMetabolism = true;
+        }
 
-            [JsonProperty(PropertyName = "Enable codelock anti-raiding")]
+        private class LootSupport
+        {
+            [JsonProperty(PropertyName = "Auto lock (codelock, keylock, nothing)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, string> AutoLock = new() { ["cupboard.tool.deployed"] = "nothing" };
+
+            [JsonProperty(PropertyName = "Exceptions for locks to various containers option", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> NoLocks = new() { "skulltrophy.deployed", "skull_fire_pit", "bbq.static", "small_refinery_static", "campfire" };
+
+            [JsonProperty(PropertyName = "Enable support to allow adding locks to various containers")]
+            public bool Locks;
+
+            [JsonProperty(PropertyName = "Enable codelock anti-raiding (team/clan/friend access only)")]
             public bool Antigrief;
 
             [JsonProperty(PropertyName = "Protect unlocked TC from being accessed by enemy players")]
@@ -4310,19 +4301,13 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Prevent players from using enemy car lifts")]
             public bool Lifts;
-
-            [JsonProperty(PropertyName = "Enable support to allow adding locks to various containers")]
-            public bool Locks;
-
-            [JsonProperty(PropertyName = "Exceptions for locks to various containers option", ObjectCreationHandling = ObjectCreationHandling.Replace)]
-            public List<string> NoLocks = new() { "skulltrophy.deployed", "skull_fire_pit", "bbq.static", "small_refinery_static", "campfire" };
-
-            [JsonProperty(PropertyName = "Auto lock (codelock, keylock, nothing)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
-            public Dictionary<string, string> AutoLock = new() { ["cupboard.tool.deployed"] = "nothing" };
         }
 
         private class ArmorDamagePVE
         {
+            [JsonProperty(PropertyName = "Skin IDs which are immune to damage", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<ulong> ImmuneSkins = new();
+
             [JsonProperty(PropertyName = "Enable support for npcs to cause armor damage on hit")]
             public bool Enabled;
 
@@ -4440,6 +4425,9 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Block Decay Damage To Vehicles")]
             public bool BlockDecayDamageToVehicles;
 
+            [JsonProperty(PropertyName = "Block Spray Can In Safe Zones")]
+            public bool BlockSprayCanInSafeZones;
+
             [JsonProperty(PropertyName = "Prevent heli from strafing in the inner radius of safe zones")]
             public bool PreventSafeZoneStrafing;
 
@@ -4548,7 +4536,7 @@ namespace Oxide.Plugins
             public RuleSet(string name) { this.name = name; }
 
             // evaluate the passed lists of entity groups against rules
-            public DamageResult Evaluate(TruePVE instance, List<string> eg1, List<string> eg2, bool returnDefaultValue = true)
+            public DamageResult Evaluate(TruePVE instance, BaseEntity attacker, List<string> eg1, BaseEntity victim, List<string> eg2, bool returnDefaultValue = true)
             {
                 bool trace = instance.trace;
 
@@ -4764,7 +4752,7 @@ namespace Oxide.Plugins
             public bool HasFlag(RuleFlags flag) => (_flags & flag) == flag;
             public bool IsEmpty() => rules.IsNullOrEmpty() && _flags == RuleFlags.None;
         }
-
+        
         private class Rule
         {
             public string ruleText;
