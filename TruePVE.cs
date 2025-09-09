@@ -447,10 +447,6 @@ namespace Oxide.Plugins
             {
                 ServerMgr.Instance.StartCoroutine(OvenCo());
             }
-            if (config.options.disableHostility)
-            {
-                Subscribe(nameof(OnEntityMarkHostile));
-            }
             RuleSet ruleSet = currentRuleSet;
             if (config.options.handleDamage && ruleSet != null && !ruleSet.IsEmpty() && ruleSet.enabled)
             {
@@ -470,6 +466,7 @@ namespace Oxide.Plugins
             {
                 Subscribe(nameof(CanLootEntity));
             }
+            Subscribe(nameof(OnEntityMarkHostile));
             Subscribe(nameof(OnEntitySpawned));
             Subscribe(nameof(OnMlrsFire));
             BuildPrefabIds();
@@ -2961,7 +2958,18 @@ namespace Oxide.Plugins
             return null;
         }
 
-        private object OnEntityMarkHostile(BasePlayer player, float duration) => true;
+        private object OnEntityMarkHostile(BasePlayer player, float duration)
+        {
+            if (config.options.disableHostility && player != null && player is BaseCombatEntity combatEntity)
+            {
+                if (Interface.CallHook("CanEntityBeHostile", new object[] { combatEntity }) is bool val)
+                {
+                    return val ? (object)null : true;
+                }
+            }
+
+            return null;
+        }
 
 #if OXIDE_PUBLICIZED || CARBON
         private void OnEntitySpawned(RidableHorse2 horse)
