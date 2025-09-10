@@ -315,6 +315,10 @@ namespace Oxide.Plugins
             {
                 ServerMgr.Instance.StartCoroutine(OvenCo());
             }
+            if (config.options.disableHostility)
+            {
+                Subscribe(nameof(OnEntityMarkHostile));
+            }
             RuleSet ruleSet = currentRuleSet;
             if (config.options.handleDamage && ruleSet != null && !ruleSet.IsEmpty() && ruleSet.enabled)
             {
@@ -335,7 +339,6 @@ namespace Oxide.Plugins
             {
                 Subscribe(nameof(CanLootEntity));
             }
-            Subscribe(nameof(OnEntityMarkHostile));
             Subscribe(nameof(OnEntitySpawned));
             Subscribe(nameof(OnMlrsFire));
             BuildPrefabIds();
