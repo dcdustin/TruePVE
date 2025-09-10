@@ -2960,12 +2960,9 @@ namespace Oxide.Plugins
 
         private object OnEntityMarkHostile(BasePlayer player, float duration)
         {
-            if (config.options.disableHostility && player != null && player is BaseCombatEntity combatEntity)
+            if (player != null && Interface.CallHook("CanMarkEntityHostile", player) is bool val)
             {
-                if (Interface.CallHook("CanEntityBeHostile", new object[] { combatEntity }) is bool val)
-                {
-                    return val ? (object)null : true;
-                }
+                return val ? (object)null : true;
             }
 
             return null;
